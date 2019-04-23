@@ -56,6 +56,7 @@ public class EndTransactionProcessor implements NettyRequestProcessor {
         final EndTransactionRequestHeader requestHeader =
             (EndTransactionRequestHeader)request.decodeCommandCustomHeader(EndTransactionRequestHeader.class);
         LOGGER.info("Transaction request:{}", requestHeader);
+        //不是主节点broker直接返回
         if (BrokerRole.SLAVE == brokerController.getMessageStoreConfig().getBrokerRole()) {
             response.setCode(ResponseCode.SLAVE_NOT_AVAILABLE);
             LOGGER.warn("Message store is slave mode, so end transaction is forbidden. ");
@@ -122,8 +123,8 @@ public class EndTransactionProcessor implements NettyRequestProcessor {
             }
         }
         OperationResult result = new OperationResult();
-        if (MessageSysFlag.TRANSACTION_COMMIT_TYPE == requestHeader.getCommitOrRollback()) {
-            result = this.brokerController.getTransactionalMessageService().commitMessage(requestHeader);
+        if (MessageSysFlag.TRANSACTION_COMMIT_TYPE == requestHeader.getCommitOrRollback()) {// 是事务消息提交状态
+            result = this.brokerController.getTransactionalMessageService().commitMessage(requestHeader);//根据header中的offset查询half消息，查不到直接返回，不作处理
             if (result.getResponseCode() == ResponseCode.SUCCESS) {
                 RemotingCommand res = checkPrepareMessage(result.getPrepareMessage(), requestHeader);
                 if (res.getCode() == ResponseCode.SUCCESS) {
@@ -132,8 +133,10 @@ public class EndTransactionProcessor implements NettyRequestProcessor {
                     msgInner.setQueueOffset(requestHeader.getTranStateTableOffset());
                     msgInner.setPreparedTransactionOffset(requestHeader.getCommitLogOffset());
                     msgInner.setStoreTimestamp(result.getPrepareMessage().getStoreTimestamp());
+                    //confirm half消息存到commitLog
                     RemotingCommand sendResult = sendFinalMessage(msgInner);
                     if (sendResult.getCode() == ResponseCode.SUCCESS) {
+                        //删除消息
                         this.brokerController.getTransactionalMessageService().deletePrepareMessage(result.getPrepareMessage());
                     }
                     return sendResult;
@@ -145,6 +148,7 @@ public class EndTransactionProcessor implements NettyRequestProcessor {
             if (result.getResponseCode() == ResponseCode.SUCCESS) {
                 RemotingCommand res = checkPrepareMessage(result.getPrepareMessage(), requestHeader);
                 if (res.getCode() == ResponseCode.SUCCESS) {
+                    //删除消息
                     this.brokerController.getTransactionalMessageService().deletePrepareMessage(result.getPrepareMessage());
                 }
                 return res;

@@ -16,22 +16,6 @@
  */
 package org.apache.rocketmq.client.impl.producer;
 
-import java.io.IOException;
-import java.net.UnknownHostException;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Random;
-import java.util.Set;
-import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.RejectedExecutionException;
-import java.util.concurrent.ThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
 import org.apache.rocketmq.client.QueryResult;
 import org.apache.rocketmq.client.Validators;
 import org.apache.rocketmq.client.common.ClientErrorCode;
@@ -46,31 +30,12 @@ import org.apache.rocketmq.client.impl.MQClientManager;
 import org.apache.rocketmq.client.impl.factory.MQClientInstance;
 import org.apache.rocketmq.client.latency.MQFaultStrategy;
 import org.apache.rocketmq.client.log.ClientLogger;
-import org.apache.rocketmq.client.producer.DefaultMQProducer;
-import org.apache.rocketmq.client.producer.LocalTransactionExecuter;
-import org.apache.rocketmq.client.producer.LocalTransactionState;
-import org.apache.rocketmq.client.producer.MessageQueueSelector;
-import org.apache.rocketmq.client.producer.SendCallback;
-import org.apache.rocketmq.client.producer.SendResult;
-import org.apache.rocketmq.client.producer.SendStatus;
-import org.apache.rocketmq.client.producer.TransactionCheckListener;
-import org.apache.rocketmq.client.producer.TransactionListener;
-import org.apache.rocketmq.client.producer.TransactionMQProducer;
-import org.apache.rocketmq.client.producer.TransactionSendResult;
+import org.apache.rocketmq.client.producer.*;
 import org.apache.rocketmq.common.MixAll;
 import org.apache.rocketmq.common.ServiceState;
 import org.apache.rocketmq.common.UtilAll;
 import org.apache.rocketmq.common.help.FAQUrl;
-import org.apache.rocketmq.common.message.Message;
-import org.apache.rocketmq.common.message.MessageAccessor;
-import org.apache.rocketmq.common.message.MessageBatch;
-import org.apache.rocketmq.common.message.MessageClientIDSetter;
-import org.apache.rocketmq.common.message.MessageConst;
-import org.apache.rocketmq.common.message.MessageDecoder;
-import org.apache.rocketmq.common.message.MessageExt;
-import org.apache.rocketmq.common.message.MessageId;
-import org.apache.rocketmq.common.message.MessageQueue;
-import org.apache.rocketmq.common.message.MessageType;
+import org.apache.rocketmq.common.message.*;
 import org.apache.rocketmq.common.protocol.ResponseCode;
 import org.apache.rocketmq.common.protocol.header.CheckTransactionStateRequestHeader;
 import org.apache.rocketmq.common.protocol.header.EndTransactionRequestHeader;
@@ -83,6 +48,11 @@ import org.apache.rocketmq.remoting.exception.RemotingConnectException;
 import org.apache.rocketmq.remoting.exception.RemotingException;
 import org.apache.rocketmq.remoting.exception.RemotingTimeoutException;
 import org.apache.rocketmq.remoting.exception.RemotingTooMuchRequestException;
+
+import java.io.IOException;
+import java.net.UnknownHostException;
+import java.util.*;
+import java.util.concurrent.*;
 
 public class DefaultMQProducerImpl implements MQProducerInner {
     private final InternalLogger log = ClientLogger.getLog();
@@ -1129,9 +1099,11 @@ public class DefaultMQProducerImpl implements MQProducerInner {
         Validators.checkMessage(msg, this.defaultMQProducer);
 
         SendResult sendResult = null;
+        //标记为事务half消息
         MessageAccessor.putProperty(msg, MessageConst.PROPERTY_TRANSACTION_PREPARED, "true");
         MessageAccessor.putProperty(msg, MessageConst.PROPERTY_PRODUCER_GROUP, this.defaultMQProducer.getProducerGroup());
         try {
+            // 发送half消息，该方法是同步发送，事务消息也必须是同步发送
             sendResult = this.send(msg);
         } catch (Exception e) {
             throw new MQClientException("send message Exception", e);
@@ -1140,6 +1112,7 @@ public class DefaultMQProducerImpl implements MQProducerInner {
         LocalTransactionState localTransactionState = LocalTransactionState.UNKNOW;
         Throwable localException = null;
         switch (sendResult.getSendStatus()) {
+            // 只有在half消息发送成功的时候才会执行事务
             case SEND_OK: {
                 try {
                     if (sendResult.getTransactionId() != null) {
@@ -1153,6 +1126,7 @@ public class DefaultMQProducerImpl implements MQProducerInner {
                         localTransactionState = localTransactionExecuter.executeLocalTransactionBranch(msg, arg);
                     } else if (transactionListener != null) {
                         log.debug("Used new transaction API");
+                        // 执行本地事务
                         localTransactionState = transactionListener.executeLocalTransaction(msg, arg);
                     }
                     if (null == localTransactionState) {
@@ -1180,6 +1154,7 @@ public class DefaultMQProducerImpl implements MQProducerInner {
         }
 
         try {
+            // 根据事务commit的情况来判断下一步操作
             this.endTransaction(sendResult, localTransactionState, localException);
         } catch (Exception e) {
             log.warn("local transaction execute " + localTransactionState + ", but end broker transaction failed", e);
@@ -1208,23 +1183,30 @@ public class DefaultMQProducerImpl implements MQProducerInner {
         final LocalTransactionState localTransactionState,
         final Throwable localException) throws RemotingException, MQBrokerException, InterruptedException, UnknownHostException {
         final MessageId id;
+        // 从broker返回的信息中获取half消息的offset
         if (sendResult.getOffsetMsgId() != null) {
             id = MessageDecoder.decodeMessageId(sendResult.getOffsetMsgId());
         } else {
             id = MessageDecoder.decodeMessageId(sendResult.getMsgId());
         }
         String transactionId = sendResult.getTransactionId();
+        //获取broker地址
         final String brokerAddr = this.mQClientFactory.findBrokerAddressInPublish(sendResult.getMessageQueue().getBrokerName());
         EndTransactionRequestHeader requestHeader = new EndTransactionRequestHeader();
+        // 需要把transactionId和offset发送给broker，便于broker查找half消息
         requestHeader.setTransactionId(transactionId);
         requestHeader.setCommitLogOffset(id.getOffset());
         switch (localTransactionState) {
+            // 表明本地址事务成功commit，告诉broker可以提交事务
             case COMMIT_MESSAGE:
                 requestHeader.setCommitOrRollback(MessageSysFlag.TRANSACTION_COMMIT_TYPE);
                 break;
+            // 说明事物需要回滚，有可能是half消息发送失败，也有可能是本地事务执行失败
             case ROLLBACK_MESSAGE:
                 requestHeader.setCommitOrRollback(MessageSysFlag.TRANSACTION_ROLLBACK_TYPE);
                 break;
+            // 如果状态是UNKNOW，broker还会反查producer，也就是接口：org.apache.rocketmq.example.transaction.TransactionCheckListenerImpl#checkLocalTransactionState的作用，
+            // 但是目前rmq4.2.0并没有向producer查询，也就是源码中都没有调用这个接口
             case UNKNOW:
                 requestHeader.setCommitOrRollback(MessageSysFlag.TRANSACTION_NOT_TYPE);
                 break;
@@ -1236,6 +1218,7 @@ public class DefaultMQProducerImpl implements MQProducerInner {
         requestHeader.setTranStateTableOffset(sendResult.getQueueOffset());
         requestHeader.setMsgId(sendResult.getMsgId());
         String remark = localException != null ? ("executeLocalTransactionBranch exception: " + localException.toString()) : null;
+        // 这个发送消息是onway的，也就是不会等待返回
         this.mQClientFactory.getMQClientAPIImpl().endTransactionOneway(brokerAddr, requestHeader, remark,
             this.defaultMQProducer.getSendMsgTimeout());
     }
